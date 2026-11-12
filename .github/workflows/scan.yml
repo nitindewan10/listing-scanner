@@ -37,6 +37,14 @@ jobs:
     env:
       MODE: ${{ vars.MODE == 'live' && 'live' || 'trial' }}
     steps:
+      - name: Check the keys
+        env:
+          HAS_STORE: ${{ secrets.STORE_REPO != '' && secrets.STORE_TOKEN != '' }}
+        run: |
+          if [ "$HAS_STORE" != "true" ]; then
+            echo "::error::The private store keys (STORE_REPO, STORE_TOKEN) are not set yet - nothing scanned."
+            exit 1
+          fi
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
         with:
           persist-credentials: false
