@@ -1,0 +1,79 @@
+name: Scan
+
+# Started at exact times by an outside free timer: 8:00 am (group 0), 1:00 pm (group 1) and 6:00 pm IST (group 2),
+# each run told its group (inputs slot + trigger=timer). GitHub's own timer below is only a back-up: it runs the
+# earliest group that is due today and has not run yet, otherwise it stops in seconds.
+# Public repository: this file and the code hold no personal data. The settings and memory live in a private store
+# (secret STORE_REPO, opened with the key STORE_TOKEN). Logs show counts only.
+# Until the repository variable MODE is "live" (trial): the store is only read, nothing is saved, Claude is never
+# woken, and the back-up timer does nothing.
+on:
+  schedule:
+    - cron: "50 2,4,6,8,10,12,14,16 * * *"   # back-up checks 8:20 am to 10:20 pm IST, every 2 hours
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "Search group: auto, 0 (8 am), 1 (1 pm), 2 (6 pm) or all"
+        default: "auto"
+      trigger:
+        description: "timer (the outside timer) or manual"
+        default: "manual"
+      fire:
+        description: "Wake Claude if something new is found (yes/no)"
+        default: "yes"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: ${{ github.event_name != 'schedule' || vars.MODE == 'live' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MODE: ${{ vars.MODE == 'live' && 'live' || 'trial' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Open the private store
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+        with:
+          repository: ${{ secrets.STORE_REPO }}
+          token: ${{ secrets.STORE_TOKEN }}
+          path: store
+          fetch-depth: 1
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b   # v5.3.0
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet --disable-pip-version-check requests==2.32.3
+      - name: Scan job sites
+        env:
+          STORE_DIR: store
+          PUBLIC_LOGS: "1"
+          ROUTINE_FIRE_URL: ${{ secrets.ROUTINE_FIRE_URL }}
+          ROUTINE_FIRE_TOKEN: ${{ secrets.ROUTINE_FIRE_TOKEN }}
+          SLOT: ${{ github.event.inputs.slot || 'auto' }}
+          TRIGGER: ${{ github.event.inputs.trigger || 'backup' }}
+          FIRE: ${{ env.MODE == 'live' && (github.event.inputs.fire || 'yes') || 'no' }}
+          EVENT: ${{ github.event_name }}
+        run: python scan.py
+      - name: Save the memory in the private store
+        if: ${{ always() && env.MODE == 'live' }}
+        run: |
+          cd store
+          git config user.name "job-scanner"
+          git config user.email "job-scanner@users.noreply.github.com"
+          git add state
+          if ! git diff --cached --quiet; then
+            git commit -q -m "scan $(date -u +%Y-%m-%d_%H%M)"
+            git pull -q --rebase
+            git push -q
+          fi
+      - name: Trial mode
+        if: ${{ env.MODE != 'live' }}
+        run: echo "Trial mode - the private store was only read; nothing saved, Claude not woken."
