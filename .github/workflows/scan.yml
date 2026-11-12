@@ -4,7 +4,8 @@ name: Scan
 # each run told its group (inputs slot + trigger=timer). GitHub's own timer below is only a back-up: it runs the
 # earliest group that is due today and has not run yet, otherwise it stops in seconds.
 # Public repository: this file and the code hold no personal data. The settings and memory live in a private store
-# (secret STORE_REPO, opened with the key STORE_TOKEN). Logs show counts only.
+# (secret STORE_REPO, opened with the key STORE_TOKEN). Logs show counts only. This job never wakes Claude: it saves
+# its results in the private store, and a small job there (which holds the wake-up key) decides whether to wake it.
 # Until the repository variable MODE is "live" (trial): the store is only read, nothing is saved, Claude is never
 # woken, and the back-up timer does nothing.
 on:
@@ -18,9 +19,6 @@ on:
       trigger:
         description: "timer (the outside timer) or manual"
         default: "manual"
-      fire:
-        description: "Wake Claude if something new is found (yes/no)"
-        default: "yes"
 
 permissions:
   contents: read
@@ -63,11 +61,10 @@ jobs:
         env:
           STORE_DIR: store
           PUBLIC_LOGS: "1"
-          ROUTINE_FIRE_URL: ${{ secrets.ROUTINE_FIRE_URL }}
-          ROUTINE_FIRE_TOKEN: ${{ secrets.ROUTINE_FIRE_TOKEN }}
+          RELAY: "1"
+          FIRE: "no"
           SLOT: ${{ github.event.inputs.slot || 'auto' }}
           TRIGGER: ${{ github.event.inputs.trigger || 'backup' }}
-          FIRE: ${{ env.MODE == 'live' && (github.event.inputs.fire || 'yes') || 'no' }}
           EVENT: ${{ github.event_name }}
         run: python scan.py
       - name: Save the memory in the private store
@@ -84,4 +81,4 @@ jobs:
           fi
       - name: Trial mode
         if: ${{ env.MODE != 'live' }}
-        run: echo "Trial mode - the private store was only read; nothing saved, Claude not woken."
+        run: echo "Trial mode - the private store was only read; nothing saved."

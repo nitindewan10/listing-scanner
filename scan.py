@@ -26,6 +26,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 STORE = os.path.abspath(os.environ.get("STORE_DIR") or ROOT)   # private store: config.json + state/
 STATE = os.path.join(STORE, "state")
 PUBLIC = os.environ.get("PUBLIC_LOGS", "") == "1"              # public logs: counts only
+RELAY = os.environ.get("RELAY", "") == "1"                     # public scan: never wakes Claude itself
+WAKE_ONLY = os.environ.get("WAKE_ONLY", "") == "1"             # private relay job: only wakes Claude
 with open(os.path.join(STORE, "config.json"), encoding="utf-8") as _f:
     CFG = json.load(_f)
 F = CFG["filters"]
@@ -662,16 +664,11 @@ def main():
         sent.pop(sid, None)
 
     # ---- source health changes worth telling Claude about
-    alerts = []
-    for name, h in health.items():
-        if h.get("fails", 0) >= 2 and h.get("said") != "down":
-            alerts.append((name, "DOWN", h))
-        elif h.get("fails", 0) == 0 and h.get("said") == "down":
-            alerts.append((name, "WORKING AGAIN", h))
+    alerts = health_alerts(health)
 
     # ---- wake Claude
     fire_ok, fire_err = None, ""
-    want_fire = os.environ.get("FIRE", "yes").lower() != "no"
+    want_fire = os.environ.get("FIRE", "yes").lower() != "no" and not RELAY
     in_fire_slot = runs_in(slot, CFG["fire"]["slots"]) or os.environ.get("TRIGGER", "") == "manual"
     if want_fire and in_fire_slot and (queue or closures or alerts):
         items = sorted(queue.values(), key=lambda x: -x["pre"])[:CFG["fire"]["max_items_per_fire"]]
@@ -690,6 +687,8 @@ def main():
                 h["said"] = "down" if state == "DOWN" else ""
     elif not (queue or closures or alerts):
         log("Nothing new - Claude not woken (zero tokens used).")
+    elif RELAY:
+        log("Results kept in the private store - the private wake-up job decides whether to wake Claude.")
     else:
         log("Holding results for the next wake-up slot.")
 
@@ -706,13 +705,14 @@ def main():
     save("sent.json", sent)
     save("health.json", health)
     save("closures.json", closures)
-    line = {"at": STAMP, "slot": str(slot), "sources": stats, "stage1_new": new1, "opened": checked,
+    line = {"at": STAMP, "slot": str(slot), "trigger": os.environ.get("TRIGGER", ""), "sources": stats, "stage1_new": new1, "opened": checked,
             "queued": passed, "queue": len(queue), "woke_claude": fire_ok, "error": fire_err}
     runs = load("runs.json", [])
     runs = (runs + [line])[-200:]
     save("runs.json", runs)
     ok = sum(1 for v in stats.values() if not str(v).startswith("FAILED"))
-    woke = "yes" if fire_ok else ("no - wake-up failed" if fire_ok is False else "no")
+    woke = ("left to the private wake-up job" if RELAY else
+            ("yes" if fire_ok else ("no - wake-up failed" if fire_ok is False else "no")))
     public = (f"{STAMP} - group {slot} - sources ok {ok} of {len(stats)} - listings read {len(found)} - "
               f"new possible {new1} - opened {checked} - queued {passed} (queue {len(queue)}) - Claude woken: {woke}")
     print(public, flush=True)
@@ -725,6 +725,75 @@ def main():
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
             f.write("## Scan\n\n" + (public if PUBLIC else "\n".join("    " + x for x in LOG)) + "\n")
+    if fire_ok is False and fire_err.startswith("config"):
+        sys.exit(f"Could not wake Claude: {fire_err}")
+
+
+def health_alerts(health):
+    alerts = []
+    for name, h in health.items():
+        if h.get("fails", 0) >= 2 and h.get("said") != "down":
+            alerts.append((name, "DOWN", h))
+        elif h.get("fails", 0) == 0 and h.get("said") == "down":
+            alerts.append((name, "WORKING AGAIN", h))
+    return alerts
+
+
+def wake_only():
+    """Private relay. It runs in the private store's own repository, where the wake-up key lives: the public
+    scan saved its results there, and this wakes the Claude task exactly as the scanner itself used to
+    (same message, same 1 pm / 6 pm groups, same bookkeeping), then records it."""
+    runs = load("runs.json", [])
+    if not runs:
+        log("No scan recorded yet - nothing to do.")
+        return
+    last = runs[-1]
+    if last.get("relay_at"):
+        log(f"Scan of {last.get('at')} already handled at {last['relay_at']} - nothing to do.")
+        return
+    s = str(last.get("slot", ""))
+    slot = int(s) if s.isdigit() else s
+    queue, seen, sent = load("queue.json", {}), load("seen.json", {}), load("sent.json", {})
+    health, closures = load("health.json", {}), load("closures.json", {})
+    alerts = health_alerts(health)
+    want_fire = os.environ.get("FIRE", "yes").lower() != "no"
+    in_fire_slot = runs_in(slot, CFG["fire"]["slots"]) or last.get("trigger") == "manual"
+    log(f"Wake-up check - {STAMP} - scan of {last.get('at')} (group {slot}): "
+        f"{len(queue)} queued, {len(closures)} closed, {len(alerts)} health changes")
+    fire_ok, fire_err = None, ""
+    if not (queue or closures or alerts):
+        log("Nothing new - Claude not woken (zero tokens used).")
+    elif not in_fire_slot:
+        log("Holding results for the next wake-up slot.")
+    else:
+        items = sorted(queue.values(), key=lambda x: -x["pre"])[:CFG["fire"]["max_items_per_fire"]]
+        text, items = build_payload(items, list(closures.values()), alerts, health,
+                                    last.get("sources") or {}, len(queue))
+        if not want_fire:
+            log(f"Test only: would wake Claude with {len(items)} new, {len(closures)} closed, "
+                f"{len(alerts)} health changes ({len(text)} characters).")
+            return
+        fire_ok, fire_err = fire(text)
+        if fire_ok:
+            for it in items:
+                queue.pop(it["id"], None)
+                seen[it["id"]] = {"d": TODAY, "s": "sent"}
+                sent[it["id"]] = {k: it.get(k, "") for k in ("id", "title", "company", "url", "source", "api")}
+                sent[it["id"]]["sent"] = TODAY
+            for sid in list(closures):
+                seen[sid] = {"d": TODAY, "s": "closed"}
+            closures = {}
+            for name, state, h in alerts:
+                h["said"] = "down" if state == "DOWN" else ""
+    if not want_fire:
+        return
+    last.update({"relay_at": STAMP, "woke_claude": fire_ok, "error": fire_err})
+    save("seen.json", seen)
+    save("queue.json", queue)
+    save("sent.json", sent)
+    save("health.json", health)
+    save("closures.json", closures)
+    save("runs.json", runs)
     if fire_ok is False and fire_err.startswith("config"):
         sys.exit(f"Could not wake Claude: {fire_err}")
 
@@ -783,7 +852,7 @@ def fire(text):
 
 if __name__ == "__main__":
     try:
-        main()
+        wake_only() if WAKE_ONLY else main()
     except SystemExit:
         raise
     except Exception as e:
